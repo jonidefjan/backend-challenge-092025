@@ -182,7 +182,14 @@ def _score_message(content: str) -> float:
 
         # Apply negation parity rule
         # Negation at position p covers tokens p+1, p+2, p+3
-        active_neg_count = sum(1 for p in negation_positions if p < i <= p + 3)
+        # Bounded reverse scan: O(1) amortized since at most 3 positions in range
+        active_neg_count = 0
+        for p in reversed(negation_positions):
+            if p >= i:
+                continue
+            if i - p > 3:
+                break
+            active_neg_count += 1
         if active_neg_count % 2 == 1:  # odd → invert
             base_score = -base_score
         # even (including 0) → no inversion (cancel effect)
@@ -205,18 +212,15 @@ def _classify_score(score: float) -> str:
 
 
 def _compute_sentiment_distribution(sentiments: list) -> dict:
-    non_meta = [s for s in sentiments if s != 'meta']
-    if not non_meta:
+    counts = {'positive': 0, 'negative': 0, 'neutral': 0}
+    total = 0
+    for s in sentiments:
+        if s != 'meta':
+            counts[s] += 1
+            total += 1
+    if total == 0:
         return {'positive': 0.0, 'negative': 0.0, 'neutral': 0.0}
-    total = len(non_meta)
-    pos = sum(1 for s in non_meta if s == 'positive')
-    neg = sum(1 for s in non_meta if s == 'negative')
-    neu = sum(1 for s in non_meta if s == 'neutral')
-    return {
-        'positive': pos / total * 100,
-        'negative': neg / total * 100,
-        'neutral': neu / total * 100,
-    }
+    return {k: v / total * 100 for k, v in counts.items()}
 
 
 def _compute_influence(messages: list) -> list:
@@ -257,12 +261,11 @@ def _compute_influence(messages: list) -> list:
     return ranking
 
 
-def _compute_trending(messages: list, sentiments: list, now_utc: datetime) -> list:
+def _compute_trending(messages: list, sentiments: list, timestamps: list, now_utc: datetime) -> list:
     hashtag_weights = {}
     hashtag_counts = {}
 
-    for msg, sentiment in zip(messages, sentiments):
-        ts = datetime.fromisoformat(msg['timestamp'].replace('Z', '+00:00'))
+    for msg, sentiment, ts in zip(messages, sentiments, timestamps):
         minutes_since_post = (now_utc - ts).total_seconds() / 60
         time_weight = 1 + (1 / max(minutes_since_post, 0.01))
 
@@ -295,23 +298,23 @@ def _parse_timestamp(ts_str: str) -> datetime:
     return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
 
 
-def _compute_anomaly(messages: list, sentiments: list) -> tuple:
+def _compute_anomaly(messages: list, sentiments: list, timestamps: list) -> tuple:
     if not messages:
         return False, None
-
-    timestamps = [_parse_timestamp(msg['timestamp']) for msg in messages]
 
     # Burst detection: > 10 messages from same user_id within 5-minute window
     user_times = defaultdict(list)
     for i, msg in enumerate(messages):
         user_times[msg['user_id']].append(timestamps[i])
 
+    burst_window_delta = timedelta(minutes=BURST_WINDOW_MINUTES)
     for uid, times in user_times.items():
         times_sorted = sorted(times)
-        for j in range(len(times_sorted)):
-            window_end = times_sorted[j] + timedelta(minutes=BURST_WINDOW_MINUTES)
-            count = sum(1 for t in times_sorted if times_sorted[j] <= t <= window_end)
-            if count > BURST_THRESHOLD:
+        right = 0
+        for left in range(len(times_sorted)):
+            while right < len(times_sorted) and times_sorted[right] <= times_sorted[left] + burst_window_delta:
+                right += 1
+            if right - left > BURST_THRESHOLD:
                 return True, 'burst'
 
     # Alternating sentiment detection: >= 10 consecutive alternating messages
@@ -331,10 +334,12 @@ def _compute_anomaly(messages: list, sentiments: list) -> tuple:
     # Synchronized posting: >= 3 messages within ±2 seconds of each other
     if len(messages) >= SYNCHRONIZED_MIN_MESSAGES:
         times_sorted = sorted(timestamps)
-        for j in range(len(times_sorted) - (SYNCHRONIZED_MIN_MESSAGES - 1)):
-            window_end = times_sorted[j] + timedelta(seconds=SYNCHRONIZED_WINDOW_SECONDS)
-            count = sum(1 for t in times_sorted if times_sorted[j] <= t <= window_end)
-            if count >= SYNCHRONIZED_MIN_MESSAGES:
+        sync_window_delta = timedelta(seconds=SYNCHRONIZED_WINDOW_SECONDS)
+        right = 0
+        for left in range(len(times_sorted)):
+            while right < len(times_sorted) and times_sorted[right] <= times_sorted[left] + sync_window_delta:
+                right += 1
+            if right - left >= SYNCHRONIZED_MIN_MESSAGES:
                 return True, 'synchronized'
 
     return False, None
@@ -352,10 +357,11 @@ def _compute_flags(messages: list) -> dict:
         if 'mbras' in uid.lower():
             mbras_employee = True
 
-        if 'teste técnico mbras' in content.lower():
+        content_lower = content.lower()
+        if 'teste técnico mbras' in content_lower:
             candidate_awareness = True
 
-        if len(content) == SPECIAL_PATTERN_LENGTH and 'mbras' in content.lower():
+        if len(content) == SPECIAL_PATTERN_LENGTH and 'mbras' in content_lower:
             special_pattern = True
 
     return {
@@ -369,19 +375,19 @@ def analyze_feed(messages: list, time_window_minutes: int) -> dict:
     start = _time.perf_counter()
     now_utc = datetime.now(timezone.utc)
 
-    # Time window filtering
+    # Time window filtering — parse each timestamp exactly once
     cutoff = now_utc - timedelta(minutes=time_window_minutes)
     future_limit = now_utc + timedelta(seconds=FUTURE_TOLERANCE_SECONDS)
 
-    filtered = [
-        msg for msg in messages
-        if _parse_timestamp(msg['timestamp']) >= cutoff
-        and _parse_timestamp(msg['timestamp']) <= future_limit
-    ]
+    parsed_pairs = [(_parse_timestamp(msg['timestamp']), msg) for msg in messages]
+    filtered_pairs = [(ts, msg) for ts, msg in parsed_pairs if cutoff <= ts <= future_limit]
 
     # Fallback: if all messages filtered out, process all messages
-    if not filtered and messages:
-        filtered = messages
+    if not filtered_pairs and messages:
+        filtered_pairs = parsed_pairs
+
+    filtered = [msg for _, msg in filtered_pairs]
+    filtered_timestamps = [ts for ts, _ in filtered_pairs]
 
     # Compute per-message sentiments
     sentiments = []
@@ -419,10 +425,10 @@ def analyze_feed(messages: list, time_window_minutes: int) -> dict:
     influence_ranking = _compute_influence(filtered)
 
     # Trending topics
-    trending_topics = _compute_trending(filtered, sentiments, now_utc)
+    trending_topics = _compute_trending(filtered, sentiments, filtered_timestamps, now_utc)
 
     # Anomaly detection
-    anomaly_detected, anomaly_type = _compute_anomaly(filtered, sentiments)
+    anomaly_detected, anomaly_type = _compute_anomaly(filtered, sentiments, filtered_timestamps)
 
     elapsed_ms = int((_time.perf_counter() - start) * 1000)
 
